@@ -1,0 +1,23 @@
+[package]
+name = "mdview"
+version = "0.1.0"
+edition = "2024"
+description = "Ultra-simple read-only Markdown viewer for Windows 11 built with Rust + GPUI"
+license = "MIT OR Apache-2.0"
+publish = false
+resolver = "2"
+
+[dependencies]
+anyhow = "1.0"
+gpui = "0.2.2"
+interprocess = "2.4"
+mermaid-rs-renderer = { version = "0.2.0", default-features = false }
+pulldown-cmark = "0.9"
+thiserror = "2.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
+opt-level = 3
