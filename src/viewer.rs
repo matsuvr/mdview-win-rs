@@ -5,8 +5,8 @@ use std::{
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, BorrowAppContext, Context, ElementId, FocusHandle, FontWeight, IntoElement, Render,
-    StyledText, TextAlign, TextStyle, Window, div, px, svg,
+    AnyElement, Context, ElementId, FocusHandle, FontWeight, IntoElement, Render,
+    SharedString, StyledText, TextAlign, TextStyle, Window, div, img, px,
 };
 use pulldown_cmark::Alignment;
 use thiserror::Error;
@@ -14,12 +14,36 @@ use thiserror::Error;
 use crate::{
     assets::AppAssets,
     markdown::{
-        Block, ListBlock, MarkdownDocument, MermaidBlock, MermaidRender, RichText, TableBlock,
-        parse_markdown,
+        Block, ListBlock, MathRender, MermaidRender, MarkdownDocument, RichText, Segment,
+        TableBlock, parse_markdown,
     },
+    math::hydrate_math_blocks,
     mermaid::hydrate_mermaid_blocks,
     theme::Theme,
 };
+
+// ---------------------------------------------------------------------------
+// Page state
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+enum PageState {
+    Welcome,
+    Loaded {
+        requested_path: PathBuf,
+        document: MarkdownDocument,
+        math_prefix: String,
+        mermaid_prefix: String,
+    },
+    Error {
+        path: PathBuf,
+        message: String,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// MarkdownWindow
+// ---------------------------------------------------------------------------
 
 pub struct MarkdownWindow {
     focus_handle: FocusHandle,
@@ -28,40 +52,28 @@ pub struct MarkdownWindow {
     page: PageState,
 }
 
-#[derive(Clone, Debug)]
-enum PageState {
-    Welcome,
-    Document(DocumentPage),
-    Error(ErrorPage),
-}
-
-#[derive(Clone, Debug)]
-struct DocumentPage {
-    requested_path: PathBuf,
-    canonical_path: Option<PathBuf>,
-    asset_prefix: String,
-    document: MarkdownDocument,
-}
-
-#[derive(Clone, Debug)]
-struct ErrorPage {
-    requested_path: Option<PathBuf>,
-    message: String,
-}
+// ---------------------------------------------------------------------------
+// Load error
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Error)]
 enum LoadError {
-    #[error("failed to read the file: {0}")]
+    #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("the file is not valid UTF-8")]
-    InvalidUtf8(#[from] std::string::FromUtf8Error),
+    #[error("File is not valid UTF-8")]
+    NotUtf8,
 }
+
+// ---------------------------------------------------------------------------
+// Construction
+// ---------------------------------------------------------------------------
 
 impl MarkdownWindow {
     pub fn welcome(cx: &mut Context<Self>) -> Self {
+        let assets = cx.try_global::<AppAssets>().cloned().unwrap_or_default();
         Self {
             focus_handle: cx.focus_handle(),
-            assets: clone_app_assets(cx),
+            assets,
             theme: Theme::default(),
             page: PageState::Welcome,
         }
@@ -72,710 +84,465 @@ impl MarkdownWindow {
         canonical_path: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let assets = clone_app_assets(cx);
-        let theme = Theme::default();
-        let page = load_page(requested_path, canonical_path, &assets);
-
-        Self {
+        let assets = cx.try_global::<AppAssets>().cloned().unwrap_or_default();
+        let mut window = Self {
             focus_handle: cx.focus_handle(),
             assets,
-            theme,
-            page,
-        }
+            theme: Theme::default(),
+            page: PageState::Welcome,
+        };
+        window.load_path(requested_path, canonical_path);
+        window
     }
 
     pub fn reload_from_request(
         &mut self,
         requested_path: PathBuf,
         canonical_path: Option<PathBuf>,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) {
-        self.clear_page_assets();
-        self.page = load_page(requested_path, canonical_path, &self.assets);
-        cx.notify();
+        self.load_path(requested_path, canonical_path);
     }
 
-    pub fn sync_window(&self, window: &mut Window) {
-        let title = self.window_title();
+    pub fn sync_window(&mut self, window: &mut Window) {
+        let title = match &self.page {
+            PageState::Welcome => "mdview".to_string(),
+            PageState::Loaded { document, .. } => {
+                document.title.clone().unwrap_or_else(|| "mdview".to_string())
+            }
+            PageState::Error { path, .. } => {
+                format!("Error — {}", path.display())
+            }
+        };
         window.set_window_title(&title);
     }
 
     pub fn focus_window(&self, window: &mut Window) {
-        window.activate_window();
         window.focus(&self.focus_handle);
     }
 
-    fn clear_page_assets(&self) {
-        if let PageState::Document(page) = &self.page {
-            self.assets.remove_prefix(&page.asset_prefix);
-        }
-    }
-
-    fn window_title(&self) -> String {
-        match &self.page {
-            PageState::Welcome => "mdview".to_string(),
-            PageState::Error(error) => {
-                let label = error
-                    .requested_path
-                    .as_deref()
-                    .map(display_name)
-                    .unwrap_or_else(|| "Open error".to_string());
-                format!("{label} · mdview")
-            }
-            PageState::Document(page) => {
-                let label = display_name(&page.requested_path);
-                format!("{label} · mdview")
-            }
-        }
-    }
-
-    fn render_document_page(&self, page: &DocumentPage) -> AnyElement {
-        let header_title = display_name(&page.requested_path);
-        let header_path = page
-            .canonical_path
-            .as_deref()
-            .map(path_to_lossy_string)
-            .unwrap_or_else(|| path_to_lossy_string(&page.requested_path));
-
-        let content = div().w_full().flex().flex_col().gap_4().children(
-            page.document
-                .blocks
-                .iter()
-                .map(|block| self.render_block(block)),
-        );
-
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(self.theme.background)
-            .track_focus(&self.focus_handle)
-            .tab_stop(true)
-            .child(self.render_header(&header_title, &header_path, page.document.title.as_deref()))
-            .child(div().w_full().h(px(1.0)).bg(self.theme.border))
-            .child(
-                div()
-                    .id(ElementId::Name(
-                        format!("document-scroll:{}", page.asset_prefix).into(),
-                    ))
-                    .flex_1()
-                    .overflow_scroll()
-                    .px_6()
-                    .py_5()
-                    .child(content),
-            )
-            .into_any_element()
-    }
-
-    fn render_welcome_page(&self) -> AnyElement {
-        let paragraphs = [
-            "超シンプルな読み取り専用マークダウンビューワーです。編集機能、タブ、ツールバー、ファイルツリーはありません。",
-            "起動例: mdview.exe README.md docs/spec.md",
-            "複数ファイルはそのまま複数ウインドウで開きます。同じ実体パスのファイルが再度要求された場合は、既存のウインドウへフォーカスを移します。",
-            "```mermaid``` フェンスは pure Rust の mermaid-rs-renderer で SVG 化して表示します。",
-        ];
-
-        let body = div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .child(self.render_plain_block("mdview", self.theme.page_title_text_style()))
-            .children(
-                paragraphs.into_iter().map(|paragraph| {
-                    self.render_plain_block(paragraph, self.theme.body_text_style())
-                }),
-            )
-            .child(self.render_plain_block(
-                "設計方針: read-only / one-window-per-file / Rust + GPUI / no unsafe in this crate",
-                self.theme.caption_text_style(),
-            ));
-
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(self.theme.background)
-            .track_focus(&self.focus_handle)
-            .tab_stop(true)
-            .child(self.render_header("mdview", "ready", None))
-            .child(div().w_full().h(px(1.0)).bg(self.theme.border))
-            .child(
-                div()
-                    .id("welcome-scroll")
-                    .flex_1()
-                    .overflow_scroll()
-                    .px_6()
-                    .py_5()
-                    .child(body),
-            )
-            .into_any_element()
-    }
-
-    fn render_error_page(&self, page: &ErrorPage) -> AnyElement {
-        let header_title = page
-            .requested_path
-            .as_deref()
-            .map(display_name)
-            .unwrap_or_else(|| "Open error".to_string());
-        let header_path = page
-            .requested_path
-            .as_deref()
-            .map(path_to_lossy_string)
-            .unwrap_or_else(|| "path unavailable".to_string());
-
-        let body = div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .child(self.render_plain_block(
-                "ファイルを開けませんでした",
-                self.theme.error_title_text_style(),
-            ))
-            .child(self.render_plain_block(&page.message, self.theme.body_text_style()));
-
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(self.theme.background)
-            .track_focus(&self.focus_handle)
-            .tab_stop(true)
-            .child(self.render_header(&header_title, &header_path, None))
-            .child(div().w_full().h(px(1.0)).bg(self.theme.border))
-            .child(
-                div()
-                    .id("error-scroll")
-                    .flex_1()
-                    .overflow_scroll()
-                    .px_6()
-                    .py_5()
-                    .child(body),
-            )
-            .into_any_element()
-    }
-
-    fn render_header(
-        &self,
-        title: &str,
-        subtitle: &str,
-        document_title: Option<&str>,
-    ) -> AnyElement {
-        let mut column = div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(self.plain_styled_text(title, self.theme.header_title_text_style()));
-
-        if let Some(document_title) = document_title {
-            if !document_title.is_empty() && document_title != title {
-                column = column
-                    .child(self.plain_styled_text(document_title, self.theme.caption_text_style()));
-            }
-        }
-
-        column = column.child(self.plain_styled_text(subtitle, self.theme.caption_text_style()));
-
-        div()
-            .w_full()
-            .bg(self.theme.header_background)
-            .px_6()
-            .py_4()
-            .child(column)
-            .into_any_element()
-    }
-
-    fn render_block(&self, block: &Block) -> AnyElement {
-        match block {
-            Block::Heading { level, content } => {
-                self.render_rich_block(content, self.theme.heading_text_style(*level))
-            }
-            Block::Paragraph(content) => {
-                self.render_rich_block(content, self.theme.body_text_style())
-            }
-            Block::CodeBlock { language, code } => {
-                self.render_code_block(language.as_deref(), code)
-            }
-            Block::Mermaid(block) => self.render_mermaid_block(block),
-            Block::BlockQuote(blocks) => {
-                let content = div()
-                    .flex_1()
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .children(blocks.iter().map(|block| self.render_block(block)));
-
-                div()
-                    .w_full()
-                    .flex()
-                    .gap_3()
-                    .child(div().w(px(3.0)).bg(self.theme.quote_bar))
-                    .child(content)
-                    .into_any_element()
-            }
-            Block::List(list) => self.render_list(list),
-            Block::Rule => div()
-                .w_full()
-                .h(px(1.0))
-                .bg(self.theme.border)
-                .into_any_element(),
-            Block::Table(table) => self.render_table(table),
-        }
-    }
-
-    fn render_list(&self, list: &ListBlock) -> AnyElement {
-        div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .children(list.items.iter().enumerate().map(|(index, item)| {
-                let marker = if let Some(checked) = item.task_state {
-                    if checked {
-                        "[x]".to_string()
-                    } else {
-                        "[ ]".to_string()
-                    }
-                } else if list.ordered {
-                    format!("{}.", list.start_index + index)
-                } else {
-                    "•".to_string()
+    fn load_path(&mut self, requested_path: PathBuf, canonical_path: Option<PathBuf>) {
+        let source = match load_source(&requested_path) {
+            Ok(s) => s,
+            Err(err) => {
+                self.page = PageState::Error {
+                    path: requested_path,
+                    message: err.to_string(),
                 };
-
-                let child_blocks = div()
-                    .flex_1()
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .children(item.blocks.iter().map(|block| self.render_block(block)));
-
-                div()
-                    .w_full()
-                    .flex()
-                    .gap_3()
-                    .child(
-                        div()
-                            .w(px(36.0))
-                            .child(self.plain_styled_text(&marker, self.theme.body_text_style())),
-                    )
-                    .child(child_blocks)
-                    .into_any_element()
-            }))
-            .into_any_element()
-    }
-
-    fn render_mermaid_block(&self, block: &MermaidBlock) -> AnyElement {
-        let mut content = div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(self.render_plain_block("mermaid", self.theme.mono_caption_text_style()));
-
-        match &block.render {
-            MermaidRender::Rendered { asset_path } => {
-                content = content.child(div().w_full().child(svg().path(asset_path.clone())));
+                return;
             }
-            MermaidRender::Failed { message } => {
-                content = content
-                    .child(self.render_plain_block(
-                        "Mermaid のレンダリングに失敗しました。",
-                        self.theme.error_text_style(),
-                    ))
-                    .child(self.render_plain_block(message, self.theme.caption_text_style()))
-                    .child(self.render_code_block(Some("mermaid"), &block.code));
-            }
-            MermaidRender::Pending => {
-                content = content.child(self.render_code_block(Some("mermaid"), &block.code));
-            }
-        }
-
-        div()
-            .w_full()
-            .bg(self.theme.code_background)
-            .p_3()
-            .child(content)
-            .into_any_element()
-    }
-
-    fn render_table(&self, table: &TableBlock) -> AnyElement {
-        let column_widths = table_column_widths(table);
-        if column_widths.is_empty() {
-            return div().w_full().into_any_element();
-        }
-
-        let total_width: f32 = column_widths.iter().sum();
-        let mut content = div()
-            .flex()
-            .flex_col()
-            .w(px(total_width))
-            .border_1()
-            .border_color(self.theme.border)
-            .rounded_sm()
-            .overflow_hidden();
-
-        let body_row_count = table.rows.len();
-
-        if let Some(header) = table.header.as_deref() {
-            content = content.child(self.render_table_row(
-                header,
-                &column_widths,
-                &table.alignments,
-                true,
-                0,
-                body_row_count > 0,
-            ));
-        }
-
-        for (row_index, row) in table.rows.iter().enumerate() {
-            content = content.child(self.render_table_row(
-                row,
-                &column_widths,
-                &table.alignments,
-                false,
-                row_index,
-                row_index + 1 < body_row_count,
-            ));
-        }
-
-        content.into_any_element()
-    }
-
-    fn render_table_row(
-        &self,
-        row: &[RichText],
-        column_widths: &[f32],
-        alignments: &[Alignment],
-        is_header: bool,
-        row_index: usize,
-        draw_bottom_border: bool,
-    ) -> AnyElement {
-        let mut row_element = div()
-            .flex()
-            .flex_row()
-            .w(px(column_widths.iter().sum()))
-            .bg(if is_header {
-                self.theme.background
-            } else if row_index.is_multiple_of(2) {
-                self.theme.code_background
-            } else {
-                self.theme.background
-            });
-
-        if draw_bottom_border {
-            row_element = row_element.border_b_1().border_color(self.theme.border);
-        }
-
-        row_element = row_element.children(column_widths.iter().enumerate().map(
-            |(column_index, width)| {
-                self.render_table_cell(
-                    row.get(column_index),
-                    *width,
-                    alignments
-                        .get(column_index)
-                        .copied()
-                        .unwrap_or(Alignment::None),
-                    is_header,
-                    column_index + 1 < column_widths.len(),
-                )
-            },
-        ));
-
-        row_element.into_any_element()
-    }
-
-    fn render_table_cell(
-        &self,
-        cell: Option<&RichText>,
-        width: f32,
-        alignment: Alignment,
-        is_header: bool,
-        draw_right_border: bool,
-    ) -> AnyElement {
-        let mut style = self.theme.body_text_style();
-        style.text_align = table_text_align(alignment);
-        if is_header {
-            style.font_weight = FontWeight::SEMIBOLD;
-        }
-
-        let mut cell_element = div()
-            .w(px(width))
-            .flex_shrink_0()
-            .px_3()
-            .py_2()
-            .child(self.render_rich_block(cell.unwrap_or(&RichText::default()), style));
-
-        if draw_right_border {
-            cell_element = cell_element.border_r_1().border_color(self.theme.border);
-        }
-
-        cell_element.into_any_element()
-    }
-
-    fn render_code_block(&self, language: Option<&str>, code: &str) -> AnyElement {
-        let mut content = div().w_full().flex().flex_col().gap_1();
-
-        if let Some(language) = language.filter(|lang| !lang.is_empty()) {
-            content = content
-                .child(self.plain_styled_text(language, self.theme.mono_caption_text_style()));
-        }
-
-        for line in code.lines() {
-            let line = if line.is_empty() { " " } else { line };
-            content = content.child(
-                self.plain_styled_text(&line.replace('\t', "    "), self.theme.mono_text_style()),
-            );
-        }
-
-        if code.is_empty() {
-            content = content.child(self.plain_styled_text(" ", self.theme.mono_text_style()));
-        }
-
-        div()
-            .w_full()
-            .bg(self.theme.code_background)
-            .p_3()
-            .child(content)
-            .into_any_element()
-    }
-
-    fn render_rich_block(&self, content: &RichText, base_style: TextStyle) -> AnyElement {
-        let lines = split_rich_lines(content);
-        let children = lines.into_iter().map(|line| {
-            div()
-                .w_full()
-                .child(self.rich_styled_text(&line, base_style.clone()))
-                .into_any_element()
-        });
-
-        div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .children(children)
-            .into_any_element()
-    }
-
-    fn render_plain_block(&self, text: &str, style: TextStyle) -> AnyElement {
-        let lines = split_plain_lines(text);
-        let children = lines.into_iter().map(|line| {
-            let line = if line.is_empty() {
-                " ".to_string()
-            } else {
-                line
-            };
-            div()
-                .w_full()
-                .child(self.plain_styled_text(&line, style.clone()))
-                .into_any_element()
-        });
-
-        div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .children(children)
-            .into_any_element()
-    }
-
-    fn rich_styled_text(&self, rich_text: &RichText, base_style: TextStyle) -> StyledText {
-        if rich_text.segments.is_empty() {
-            return StyledText::new(" ".to_string()).with_runs(vec![base_style.to_run(1)]);
-        }
-
-        let mut text = String::new();
-        let mut runs = Vec::with_capacity(rich_text.segments.len());
-
-        for segment in &rich_text.segments {
-            text.push_str(&segment.text);
-            let style = self
-                .theme
-                .apply_inline_style(base_style.clone(), &segment.style);
-            runs.push(style.to_run(segment.text.len()));
-        }
-
-        StyledText::new(text).with_runs(runs)
-    }
-
-    fn plain_styled_text(&self, text: &str, style: TextStyle) -> StyledText {
-        let text = if text.is_empty() {
-            " ".to_string()
-        } else {
-            text.to_string()
         };
-        let len = text.len();
-        StyledText::new(text).with_runs(vec![style.to_run(len)])
+
+        let mut document = parse_markdown(&source);
+
+        let canon = canonical_path.as_deref();
+        let math_prefix = hydrate_math_blocks(&mut document, &requested_path, canon, &self.assets);
+        let mermaid_prefix =
+            hydrate_mermaid_blocks(&mut document, &requested_path, canon, &self.assets);
+
+        self.page = PageState::Loaded {
+            requested_path,
+            document,
+            math_prefix,
+            mermaid_prefix,
+        };
     }
 }
 
-impl Drop for MarkdownWindow {
-    fn drop(&mut self) {
-        self.clear_page_assets();
-    }
+// ---------------------------------------------------------------------------
+// File loading
+// ---------------------------------------------------------------------------
+
+fn load_source(path: &Path) -> Result<String, LoadError> {
+    let bytes = fs::read(path)?;
+    String::from_utf8(bytes).map_err(|_| LoadError::NotUtf8)
 }
+
+// ---------------------------------------------------------------------------
+// Render
+// ---------------------------------------------------------------------------
 
 impl Render for MarkdownWindow {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        match &self.page {
-            PageState::Welcome => self.render_welcome_page(),
-            PageState::Document(page) => self.render_document_page(page),
-            PageState::Error(page) => self.render_error_page(page),
-        }
-    }
-}
+        let theme = self.theme.clone();
 
-fn clone_app_assets(cx: &mut Context<MarkdownWindow>) -> AppAssets {
-    cx.update_global(|assets: &mut AppAssets, _| assets.clone())
-}
-
-fn load_page(
-    requested_path: PathBuf,
-    canonical_path: Option<PathBuf>,
-    assets: &AppAssets,
-) -> PageState {
-    match load_document(&requested_path, canonical_path.as_deref(), assets) {
-        Ok((document, asset_prefix)) => PageState::Document(DocumentPage {
-            requested_path,
-            canonical_path,
-            asset_prefix,
-            document,
-        }),
-        Err(error) => PageState::Error(ErrorPage {
-            requested_path: Some(requested_path),
-            message: error.to_string(),
-        }),
-    }
-}
-
-fn load_document(
-    path: &Path,
-    canonical_path: Option<&Path>,
-    assets: &AppAssets,
-) -> Result<(MarkdownDocument, String), LoadError> {
-    let bytes = fs::read(path)?;
-    let source = String::from_utf8(bytes)?;
-    let mut document = parse_markdown(&source);
-    let asset_prefix = hydrate_mermaid_blocks(&mut document, path, canonical_path, assets);
-    Ok((document, asset_prefix))
-}
-
-fn display_name(path: &Path) -> String {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| path_to_lossy_string(path))
-}
-
-fn path_to_lossy_string(path: &Path) -> String {
-    path.to_string_lossy().replace("\\\\?\\", "")
-}
-
-fn split_plain_lines(text: &str) -> Vec<String> {
-    let mut lines: Vec<String> = text.split('\n').map(ToOwned::to_owned).collect();
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-    lines
-}
-
-fn split_rich_lines(rich_text: &RichText) -> Vec<RichText> {
-    let mut lines = vec![RichText::default()];
-
-    for segment in &rich_text.segments {
-        let mut remaining = segment.text.as_str();
-        loop {
-            if let Some(newline_index) = remaining.find('\n') {
-                let (before_newline, after_newline) = remaining.split_at(newline_index);
-                if !before_newline.is_empty() {
-                    lines
-                        .last_mut()
-                        .expect("at least one line exists")
-                        .push_str(before_newline, segment.style.clone());
-                }
-                lines.push(RichText::default());
-                remaining = &after_newline[1..];
-            } else {
-                if !remaining.is_empty() {
-                    lines
-                        .last_mut()
-                        .expect("at least one line exists")
-                        .push_str(remaining, segment.style.clone());
-                }
-                break;
+        let content: AnyElement = match &self.page {
+            PageState::Welcome => render_welcome(&theme).into_any_element(),
+            PageState::Loaded { document, .. } => {
+                render_document(document, &theme).into_any_element()
             }
-        }
-    }
-
-    if lines.is_empty() {
-        lines.push(RichText::default());
-    }
-
-    lines
-}
-
-fn table_column_widths(table: &TableBlock) -> Vec<f32> {
-    let column_count = table
-        .header
-        .as_ref()
-        .map(|header| header.len())
-        .into_iter()
-        .chain(table.rows.iter().map(Vec::len))
-        .max()
-        .unwrap_or(0);
-
-    let mut widths: Vec<f32> = vec![120.0; column_count];
-
-    let mut absorb_row = |row: &[RichText]| {
-        for (index, cell) in row.iter().enumerate() {
-            let width = table_width_from_text(&cell.plain_text());
-            widths[index] = widths[index].max(width);
-        }
-    };
-
-    if let Some(header) = &table.header {
-        absorb_row(header);
-    }
-    for row in &table.rows {
-        absorb_row(row);
-    }
-
-    widths
-}
-
-fn table_width_from_text(text: &str) -> f32 {
-    let score = text
-        .lines()
-        .map(display_width)
-        .max()
-        .unwrap_or(0)
-        .clamp(6, 40) as f32;
-
-    24.0 + score * 8.0
-}
-
-fn table_text_align(alignment: Alignment) -> TextAlign {
-    match alignment {
-        Alignment::Center => TextAlign::Center,
-        Alignment::Right => TextAlign::Right,
-        Alignment::Left | Alignment::None => TextAlign::Left,
-    }
-}
-
-fn display_width(text: &str) -> usize {
-    text.chars()
-        .map(|ch| {
-            if ch == '\t' {
-                4
-            } else if ch.is_ascii() {
-                1
-            } else {
-                2
+            PageState::Error { path, message } => {
+                render_error(path, message, &theme).into_any_element()
             }
+        };
+
+        div()
+            .id("markdown-scroll")
+            .track_focus(&self.focus_handle)
+            .bg(theme.background)
+            .size_full()
+            .overflow_y_scroll()
+            .child(
+                div()
+                    .max_w(px(900.0))
+                    .mx_auto()
+                    .px(px(32.0))
+                    .py(px(24.0))
+                    .child(content),
+            )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Page renderers
+// ---------------------------------------------------------------------------
+
+fn render_welcome(theme: &Theme) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(16.0))
+        .child(
+            div().child(StyledText::new("mdview").with_default_highlights(
+                &theme.page_title_text_style(),
+                [],
+            )),
+        )
+        .child(div().child(StyledText::new(
+            "ファイルをコマンドライン引数で指定してください。\n例: mdview.exe README.md",
+        ).with_default_highlights(&theme.body_text_style(), [])))
+}
+
+fn render_error(path: &Path, message: &str, theme: &Theme) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .child(div().child(StyledText::new("ファイルを開けませんでした").with_default_highlights(
+            &theme.error_title_text_style(),
+            [],
+        )))
+        .child(div().child(
+            StyledText::new(path.display().to_string()).with_default_highlights(&theme.error_text_style(), []),
+        ))
+        .child(div().child(
+            StyledText::new(message.to_string()).with_default_highlights(&theme.body_text_style(), []),
+        ))
+}
+
+fn render_document(document: &MarkdownDocument, theme: &Theme) -> impl IntoElement {
+    let children: Vec<AnyElement> = document
+        .blocks
+        .iter()
+        .map(|block| render_block(block, theme).into_any_element())
+        .collect();
+
+    div().flex().flex_col().gap(px(12.0)).children(children)
+}
+
+// ---------------------------------------------------------------------------
+// Block renderers
+// ---------------------------------------------------------------------------
+
+fn render_block(block: &Block, theme: &Theme) -> impl IntoElement {
+    match block {
+        Block::Heading { level, content } => render_heading(*level, content, theme).into_any_element(),
+        Block::Paragraph(rich) => render_paragraph(rich, theme).into_any_element(),
+        Block::CodeBlock { language, code } => {
+            render_code_block(language.as_deref(), code, theme).into_any_element()
+        }
+        Block::BlockQuote(children) => render_blockquote(children, theme).into_any_element(),
+        Block::List(list) => render_list(list, theme).into_any_element(),
+        Block::Rule => render_rule(theme).into_any_element(),
+        Block::Table(table) => render_table(table, theme).into_any_element(),
+        Block::Math(math) => render_math_block(math, theme).into_any_element(),
+        Block::Mermaid(mermaid) => render_mermaid_block(mermaid, theme).into_any_element(),
+    }
+}
+
+fn render_heading(level: u8, content: &RichText, theme: &Theme) -> impl IntoElement {
+    let style = theme.heading_text_style(level);
+    let text = content.plain_text();
+    div()
+        .mt(px(match level {
+            1 => 24.0,
+            2 => 20.0,
+            _ => 16.0,
+        }))
+        .mb(px(8.0))
+        .child(StyledText::new(text).with_default_highlights(&style, []))
+}
+
+fn render_paragraph(rich: &RichText, theme: &Theme) -> impl IntoElement {
+    let style = theme.body_text_style();
+    let children: Vec<AnyElement> = rich
+        .segments
+        .iter()
+        .map(|seg| render_segment(seg, theme, &style))
+        .collect();
+
+    div()
+        .flex()
+        .flex_wrap()
+        .items_baseline()
+        .gap_x(px(0.0))
+        .children(children)
+}
+
+fn render_segment(seg: &Segment, theme: &Theme, base_style: &TextStyle) -> AnyElement {
+    match seg {
+        Segment::Text(t) => {
+            let style = theme.apply_inline_style(base_style.clone(), &t.style);
+            StyledText::new(t.text.clone())
+                .with_default_highlights(&style, [])
+                .into_any_element()
+        }
+        Segment::InlineMath(math) => render_inline_math(math, theme).into_any_element(),
+    }
+}
+
+fn render_inline_math(math: &crate::markdown::MathBlock, theme: &Theme) -> impl IntoElement {
+    match &math.render {
+        MathRender::Rendered { asset_path } => {
+            img(SharedString::from(asset_path.clone()))
+                .into_any_element()
+        }
+        MathRender::Pending => {
+            let style = theme.mono_text_style();
+            StyledText::new(format!("${}", math.latex))
+                .with_default_highlights(&style, [])
+                .into_any_element()
+        }
+        MathRender::Failed { message } => {
+            let mut style = theme.mono_text_style();
+            style.color = theme.error;
+            StyledText::new(format!("${}$ ({})", math.latex, message))
+                .with_default_highlights(&style, [])
+                .into_any_element()
+        }
+    }
+}
+
+fn render_math_block(math: &crate::markdown::MathBlock, theme: &Theme) -> impl IntoElement {
+    match &math.render {
+        MathRender::Rendered { asset_path } => div()
+            .my(px(16.0))
+            .flex()
+            .justify_center()
+            .child(img(SharedString::from(asset_path.clone())))
+            .into_any_element(),
+        MathRender::Pending => {
+            let style = theme.mono_text_style();
+            div()
+                .my(px(16.0))
+                .px(px(16.0))
+                .py(px(8.0))
+                .bg(theme.code_background)
+                .border_1()
+                .border_color(theme.border)
+                .child(StyledText::new(format!("$${}$$", math.latex)).with_default_highlights(&style, []))
+                .into_any_element()
+        }
+        MathRender::Failed { message } => {
+            let mut style = theme.mono_text_style();
+            style.color = theme.error;
+            div()
+                .my(px(16.0))
+                .child(StyledText::new(format!("[math error: {}]", message)).with_default_highlights(&style, []))
+                .into_any_element()
+        }
+    }
+}
+
+fn render_mermaid_block(mermaid: &crate::markdown::MermaidBlock, theme: &Theme) -> impl IntoElement {
+    match &mermaid.render {
+        MermaidRender::Rendered { asset_path } => div()
+            .my(px(16.0))
+            .flex()
+            .justify_center()
+            .child(img(SharedString::from(asset_path.clone())))
+            .into_any_element(),
+        MermaidRender::Pending | MermaidRender::Failed { .. } => {
+            let style = theme.mono_text_style();
+            let msg = match &mermaid.render {
+                MermaidRender::Failed { message } => format!("[mermaid error: {message}]"),
+                _ => format!("```mermaid\n{}\n```", mermaid.code),
+            };
+            div()
+                .my(px(16.0))
+                .px(px(16.0))
+                .py(px(8.0))
+                .bg(theme.code_background)
+                .border_1()
+                .border_color(theme.border)
+                .child(StyledText::new(msg).with_default_highlights(&style, []))
+                .into_any_element()
+        }
+    }
+}
+
+fn render_code_block(language: Option<&str>, code: &str, theme: &Theme) -> impl IntoElement {
+    let style = theme.mono_text_style();
+    let header = language.map(|lang| {
+        div()
+            .px(px(12.0))
+            .py(px(4.0))
+            .bg(theme.border)
+            .child(StyledText::new(lang.to_string()).with_default_highlights(&theme.mono_caption_text_style(), []))
+            .into_any_element()
+    });
+
+    let mut container = div()
+        .my(px(12.0))
+        .bg(theme.code_background)
+        .border_1()
+        .border_color(theme.border)
+        .flex()
+        .flex_col();
+
+    if let Some(h) = header {
+        container = container.child(h);
+    }
+
+    container.child(
+        div()
+            .px(px(16.0))
+            .py(px(12.0))
+            
+            .child(StyledText::new(code.to_string()).with_default_highlights(&style, [])),
+    )
+}
+
+fn render_blockquote(children: &[Block], theme: &Theme) -> impl IntoElement {
+    let child_elements: Vec<AnyElement> = children
+        .iter()
+        .map(|b| render_block(b, theme).into_any_element())
+        .collect();
+
+    div()
+        .my(px(8.0))
+        .pl(px(16.0))
+        .border_l_4()
+        .border_color(theme.quote_bar)
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .children(child_elements)
+}
+
+fn render_list(list: &ListBlock, theme: &Theme) -> impl IntoElement {
+    let items: Vec<AnyElement> = list
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let marker = if list.ordered {
+                format!("{}.", list.start_index + i)
+            } else {
+                match item.task_state {
+                    Some(true) => "☑".to_string(),
+                    Some(false) => "☐".to_string(),
+                    None => "•".to_string(),
+                }
+            };
+
+            let marker_style = theme.body_text_style();
+            let item_blocks: Vec<AnyElement> = item
+                .blocks
+                .iter()
+                .map(|b| render_block(b, theme).into_any_element())
+                .collect();
+
+            div()
+                .flex()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .w(px(24.0))
+                        .flex_shrink_0()
+                        .child(StyledText::new(marker).with_default_highlights(&marker_style, [])),
+                )
+                .child(div().flex().flex_col().gap(px(4.0)).children(item_blocks))
+                .into_any_element()
         })
-        .sum::<usize>()
-        .max(1)
+        .collect();
+
+    div().my(px(8.0)).flex().flex_col().gap(px(4.0)).children(items)
+}
+
+fn render_rule(theme: &Theme) -> impl IntoElement {
+    div()
+        .my(px(16.0))
+        .h(px(1.0))
+        .bg(theme.border)
+}
+
+fn render_table(table: &TableBlock, theme: &Theme) -> impl IntoElement {
+    let header_style = {
+        let mut s = theme.body_text_style();
+        s.font_weight = FontWeight::BOLD;
+        s
+    };
+    let cell_style = theme.body_text_style();
+
+    let header_row: Option<AnyElement> = table.header.as_ref().map(|cells| {
+        let cols: Vec<AnyElement> = cells
+            .iter()
+            .enumerate()
+            .map(|(i, cell)| {
+                let align = table.alignments.get(i).copied();
+                div()
+                    .flex_1()
+                    .px(px(12.0))
+                    .py(px(8.0))
+                    .bg(theme.header_background)
+                    .border_1()
+                    .border_color(theme.border)
+                    .child(
+                        StyledText::new(cell.plain_text())
+                            .with_default_highlights(&header_style, []),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        div().flex().children(cols).into_any_element()
+    });
+
+    let rows: Vec<AnyElement> = table
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(row_idx, cells)| {
+            let cols: Vec<AnyElement> = cells
+                .iter()
+                .enumerate()
+                .map(|(i, cell)| {
+                    div()
+                        .flex_1()
+                        .px(px(12.0))
+                        .py(px(6.0))
+                        .border_1()
+                        .border_color(theme.border)
+                        .child(
+                            StyledText::new(cell.plain_text()).with_default_highlights(&cell_style, []),
+                        )
+                        .into_any_element()
+                })
+                .collect();
+            div().flex().children(cols).into_any_element()
+        })
+        .collect();
+
+    let mut table_div = div()
+        .my(px(16.0))
+        .border_1()
+        .border_color(theme.border)
+        .flex()
+        .flex_col();
+
+    if let Some(h) = header_row {
+        table_div = table_div.child(h);
+    }
+
+    table_div.children(rows)
 }

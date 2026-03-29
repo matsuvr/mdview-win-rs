@@ -20,10 +20,6 @@ impl AppAssets {
         path
     }
 
-    pub fn insert_svg(&self, path: impl Into<String>, svg: String) -> String {
-        self.insert_bytes(path, svg.into_bytes())
-    }
-
     pub fn remove_prefix(&self, prefix: &str) {
         let prefix = normalize_asset_path(prefix.to_string());
         let mut guard = write_map(&self.inner);
@@ -39,9 +35,12 @@ impl AssetSource for AppAssets {
             return Ok(None);
         }
 
-        let path = normalize_asset_path(path.to_string());
+        let normalized_path = normalize_asset_path(path.to_string());
+
         let guard = read_map(&self.inner);
-        Ok(guard.get(&path).cloned().map(Cow::Owned))
+        let result: Option<Cow<'static, [u8]>> = guard.get(&normalized_path).cloned().map(Cow::Owned);
+
+        Ok(result)
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {

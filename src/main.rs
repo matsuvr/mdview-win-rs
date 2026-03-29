@@ -10,6 +10,7 @@ compile_error!("mdview targets Windows x64 only.");
 mod assets;
 mod ipc;
 mod markdown;
+mod math;
 mod mermaid;
 mod registry;
 mod theme;

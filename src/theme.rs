@@ -6,7 +6,7 @@ use gpui::{
 use crate::markdown::InlineStyle;
 
 const BODY_FONT: &str = "Segoe UI";
-const MONO_FONT: &str = "Consolas";
+pub(crate) const MONO_FONT: &str = "Consolas";
 
 #[derive(Clone, Debug)]
 pub struct Theme {
@@ -25,7 +25,7 @@ pub struct Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            background: rgb(0xf6f8fa).into(),
+            background: rgb(0xffffff).into(),
             header_background: rgb(0xffffff).into(),
             text: rgb(0x1f2328).into(),
             muted_text: rgb(0x57606a).into(),
